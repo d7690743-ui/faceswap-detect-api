@@ -1,19 +1,11 @@
-import base64
-import json
 import os
-import tempfile
-from typing import Any
-
-import cv2
-import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+import httpx
+from fastapi import FastAPI, File, HTTPException, Header, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from insightface.app import FaceAnalysis
+from fastapi.responses import Response
 
-app = FastAPI(title="FaceSwap Detection API", version="0.1.0")
+app = FastAPI(title="FaceSwap Detection API Proxy", version="0.2.0")
 
-# Set FRONTEND_ORIGIN to your exact frontend URL in Vercel.
-# "*" is convenient for initial testing; restrict it before public use.
 frontend_origin = os.getenv("FRONTEND_ORIGIN", "*")
 app.add_middleware(
     CORSMiddleware,
@@ -23,88 +15,76 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_face_app = None
+def get_space_url():
+    url = os.getenv("HF_SPACE_URL", "").strip().rstrip("/")
+    if not url:
+        raise HTTPException(
+            status_code=503,
+            detail="Falta configurar HF_SPACE_URL en las variables de entorno de Vercel.",
+        )
+    return url
 
-def get_face_app():
-    """Lazy-load Buffalo_L. First cold start can be slow and memory-heavy."""
-    global _face_app
-    if _face_app is None:
-        try:
-            _face_app = FaceAnalysis(
-                name=os.getenv("INSIGHTFACE_MODEL", "buffalo_l"),
-                providers=["CPUExecutionProvider"],
-            )
-            _face_app.prepare(ctx_id=-1, det_size=(640, 640))
-        except Exception as exc:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "No se pudo cargar el modelo InsightFace. "
-                    "Revisa los logs de Vercel y los límites de memoria/tiempo. "
-                    f"Detalle: {type(exc).__name__}: {exc}"
-                ),
-            )
-    return _face_app
+def get_headers():
+    headers = {}
+    key = os.getenv("INFERENCE_API_KEY", "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
 
 @app.get("/")
 def home():
     return {
         "service": "faceswap-detect-api",
         "status": "ok",
-        "model": os.getenv("INSIGHTFACE_MODEL", "buffalo_l"),
-        "endpoints": ["/health", "/detect"],
-        "note": "El estado ok no significa que el modelo ya se haya descargado/cargado."
+        "mode": "proxy",
+        "inference_configured": bool(os.getenv("HF_SPACE_URL", "").strip()),
     }
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "model_configured": os.getenv("INSIGHTFACE_MODEL", "buffalo_l")}
+async def health():
+    url = get_space_url()
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url + "/health", headers=get_headers())
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            media_type=response.headers.get("content-type", "application/json"),
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"No se pudo contactar el servicio de inferencia: {type(exc).__name__}")
 
 @app.post("/detect")
 async def detect(file: UploadFile = File(...)):
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=415, detail="Sube un archivo de imagen.")
-
-    # Protect the function from unexpectedly large uploads.
-    max_bytes = 8 * 1024 * 1024
-    content = await file.read(max_bytes + 1)
-    if len(content) > max_bytes:
+    content = await file.read(8 * 1024 * 1024 + 1)
+    if len(content) > 8 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="La imagen debe pesar 8 MB o menos.")
     if not content:
         raise HTTPException(status_code=400, detail="El archivo está vacío.")
 
-    image_array = np.frombuffer(content, dtype=np.uint8)
-    image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-    if image is None:
-        raise HTTPException(status_code=400, detail="No se pudo leer la imagen.")
-
-    face_app = get_face_app()
-    faces = face_app.get(image)
-
-    results: list[dict[str, Any]] = []
-    for idx, face in enumerate(faces):
-        bbox = [round(float(x), 2) for x in face.bbox.tolist()]
-        result = {
-            "index": idx,
-            "bbox": bbox,
-            "det_score": round(float(face.det_score), 4),
-        }
-        if getattr(face, "kps", None) is not None:
-            result["landmarks"] = [
-                [round(float(p[0]), 2), round(float(p[1]), 2)]
-                for p in face.kps.tolist()
-            ]
-        # Return the embedding for use by a compatible swap pipeline.
-        # This is biometric data: only send/store it with the person's consent.
-        embedding = getattr(face, "normed_embedding", None)
-        if embedding is not None:
-            result["embedding"] = [round(float(x), 7) for x in embedding.tolist()]
-        results.append(result)
-
-    return {
-        "filename": file.filename,
-        "image_width": int(image.shape[1]),
-        "image_height": int(image.shape[0]),
-        "face_count": len(results),
-        "faces": results,
+    url = get_space_url()
+    files = {
+        "file": (
+            file.filename or "image.jpg",
+            content,
+            file.content_type or "application/octet-stream",
+        )
     }
+    try:
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            response = await client.post(
+                url + "/detect",
+                files=files,
+                headers=get_headers(),
+            )
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            media_type=response.headers.get("content-type", "application/json"),
+        )
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="El servicio de inferencia tardó demasiado. Espera a que despierte y vuelve a intentarlo.")
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"No se pudo contactar el servicio de inferencia: {type(exc).__name__}")
